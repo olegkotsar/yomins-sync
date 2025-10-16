@@ -1,0 +1,23 @@
+s3toftp
+yomins-sync*
+/credentials.go
+cache.db
+filecache.db
+test-cache.db
+/bin/
+/build/
+/dist/
+/pkg/
+/vendor/
+*.log
+*.swp
+*.tmp
+*.DS_Store
+.idea/
+.vscode/
+*.iml
+# Secrets
+.env
+.env.*
+.claude/
+CLAUDE.md
