@@ -52,8 +52,16 @@ func NewS3Source(cfg *config.S3Config, common *config.CommonSourceConfig) (*S3So
 		limiter = rate.NewLimiter(rate.Limit(common.MaxRPS), int(common.MaxRPS)) // burst = MaxRPS
 	}
 
+	// For S3-compatible storage, region is often just a placeholder
+	// Use provided region or default to "us-east-1"
+	region := cfg.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
 	s3cfg, err := s3config.LoadDefaultConfig(
 		ctx,
+		s3config.WithRegion(region),
 		s3config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, "")),
 		// Suppress AWS SDK logging warnings about missing checksums
 		s3config.WithClientLogMode(0),
@@ -64,6 +72,8 @@ func NewS3Source(cfg *config.S3Config, common *config.CommonSourceConfig) (*S3So
 
 	client := s3.NewFromConfig(s3cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
+		// Use path-style addressing for S3-compatible storage
+		o.UsePathStyle = true
 	})
 
 	return &S3Source{

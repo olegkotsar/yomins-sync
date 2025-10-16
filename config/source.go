@@ -90,6 +90,7 @@ func (s3c *S3Config) Validate() error {
 	if s3c.Endpoint == "" {
 		return fmt.Errorf("s3 endpoint is required")
 	}
+	// Region is optional - will default to "us-east-1" if not provided
 	return nil
 }
 
