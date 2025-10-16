@@ -1,4 +1,4 @@
-.PHONY: all build-linux-amd64 build-linux-arm64 clean test
+.PHONY: all build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 clean test
 
 # Binary name
 BINARY_NAME=yomins-sync
@@ -11,7 +11,7 @@ VERSION?=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS=-ldflags "-X main.version=$(VERSION)"
 
 # Default target
-all: build-linux-amd64 build-linux-arm64
+all: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64
 
 # Create build directory
 $(BUILD_DIR):
@@ -29,6 +29,18 @@ build-linux-arm64: $(BUILD_DIR)
 	GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64 ./cmd/main.go
 	@echo "Built: $(BUILD_DIR)/$(BINARY_NAME)-linux-arm64"
 
+# Build for macOS AMD64 (Intel)
+build-darwin-amd64: $(BUILD_DIR)
+	@echo "Building $(BINARY_NAME) for macOS AMD64..."
+	GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64 ./cmd/main.go
+	@echo "Built: $(BUILD_DIR)/$(BINARY_NAME)-darwin-amd64"
+
+# Build for macOS ARM64 (Apple Silicon)
+build-darwin-arm64: $(BUILD_DIR)
+	@echo "Building $(BINARY_NAME) for macOS ARM64..."
+	GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64 ./cmd/main.go
+	@echo "Built: $(BUILD_DIR)/$(BINARY_NAME)-darwin-arm64"
+
 # Run tests
 test:
 	go test ./...
@@ -42,18 +54,21 @@ clean:
 # Show help
 help:
 	@echo "Available targets:"
-	@echo "  all                - Build all architectures (default)"
-	@echo "  build-linux-amd64  - Build for Linux AMD64"
-	@echo "  build-linux-arm64  - Build for Linux ARM64"
-	@echo "  test               - Run all tests"
-	@echo "  clean              - Remove build artifacts"
-	@echo "  help               - Show this help message"
+	@echo "  all                 - Build all architectures (default)"
+	@echo "  build-linux-amd64   - Build for Linux AMD64"
+	@echo "  build-linux-arm64   - Build for Linux ARM64"
+	@echo "  build-darwin-amd64  - Build for macOS AMD64 (Intel)"
+	@echo "  build-darwin-arm64  - Build for macOS ARM64 (Apple Silicon)"
+	@echo "  test                - Run all tests"
+	@echo "  clean               - Remove build artifacts"
+	@echo "  help                - Show this help message"
 	@echo ""
 	@echo "Variables:"
-	@echo "  VERSION            - Set version (default: git tag or 'dev')"
+	@echo "  VERSION             - Set version (default: git tag or 'dev')"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make                       # Build all architectures"
-	@echo "  make build-linux-amd64     # Build only AMD64"
-	@echo "  make VERSION=1.2.3         # Build with specific version"
-	@echo "  make clean                 # Clean build directory"
+	@echo "  make                        # Build all architectures"
+	@echo "  make build-linux-amd64      # Build only Linux AMD64"
+	@echo "  make build-darwin-arm64     # Build only macOS ARM64"
+	@echo "  make VERSION=1.2.3          # Build with specific version"
+	@echo "  make clean                  # Clean build directory"
