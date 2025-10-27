@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -923,6 +924,7 @@ func TestProcessSourceFiles_EmptySource(t *testing.T) {
 // Tests for syncNewFilesActual (actual upload mode)
 
 type mockDestinationProvider struct {
+	mu              sync.Mutex
 	uploadedFiles   []string
 	failOnUpload    map[string]error // Map of files that should fail to upload
 	deletedFiles    []string
@@ -934,21 +936,35 @@ func (m *mockDestinationProvider) Upload(ctx context.Context, key string, reader
 	if err, shouldFail := m.failOnUpload[key]; shouldFail {
 		return err
 	}
-	m.uploadedFiles = append(m.uploadedFiles, key)
 	// Read all content to simulate actual upload
 	_, err := io.ReadAll(reader)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Thread-safe append
+	m.mu.Lock()
+	m.uploadedFiles = append(m.uploadedFiles, key)
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *mockDestinationProvider) Delete(ctx context.Context, key string) error {
 	if err, shouldFail := m.failOnDelete[key]; shouldFail {
 		return err
 	}
+
+	// Thread-safe append
+	m.mu.Lock()
 	m.deletedFiles = append(m.deletedFiles, key)
+	m.mu.Unlock()
 	return nil
 }
 
 func (m *mockDestinationProvider) FileExists(ctx context.Context, key string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	for _, f := range m.uploadedFiles {
 		if f == key {
 			return true, nil
@@ -1524,4 +1540,260 @@ func TestRun_DryRunMode(t *testing.T) {
 	meta, err := c.Get("file1.txt")
 	require.NoError(t, err)
 	require.Equal(t, model.StatusNew, meta.Status, "file should remain NEW in dry-run mode")
+}
+
+// ================== DEADLOCK REGRESSION TESTS ==================
+//
+// These tests prevent a specific deadlock issue that was discovered:
+//
+// The Problem:
+// - IterateBatches() holds a read transaction open for the entire iteration
+// - It sends batches through an unbuffered channel
+// - prepareForScan/finalizeStatesAfterScan receive batches and call BatchSet()
+// - BatchSet() requires a write transaction, which blocks on the read transaction
+// - The read transaction can't complete because it's blocked sending the next batch
+// - Result: DEADLOCK
+//
+// The Fix:
+// - Collect all updates in memory first (don't call BatchSet during iteration)
+// - Only call BatchSet after IterateBatches completes
+//
+// These tests ensure the fix works by:
+// - Testing with multiple batches (larger than batchSize)
+// - Using a timeout to detect hangs
+// - Verifying all updates are actually applied
+//
+// See: processor.go:187-240 (prepareForScan) and processor.go:242-296 (finalizeStatesAfterScan)
+
+func TestPrepareForScan_NoDeadlock_MultipleBatches(t *testing.T) {
+	c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	// Create MORE entries than the batch size (10,000) to ensure multiple batches
+	// This tests that the function doesn't deadlock when processing multiple batches
+	numFiles := 25000
+	entries := make(map[string]model.FileMeta)
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("file%05d", i)
+		entries[key] = model.FileMeta{
+			Hash:    fmt.Sprintf("hash%d", i),
+			Size:    int64(i),
+			ModTime: int64(i * 1000),
+			Status:  model.StatusSynced,
+		}
+	}
+	require.NoError(t, c.BatchSet(entries))
+
+	r := NewRunner(c, nil, nil, nil, false)
+
+	// Use a timeout context to detect deadlocks
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// This should complete without hanging
+	start := time.Now()
+	stats, err := r.prepareForScan(ctx)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "prepareForScan should not deadlock")
+	require.NotNil(t, stats)
+	require.Equal(t, int64(numFiles), stats.TotalProcessed)
+	require.Equal(t, int64(numFiles), stats.SyncedToTempDeleted)
+
+	t.Logf("PrepareForScan processed %d files in %v (%.0f files/sec)",
+		numFiles, elapsed, float64(numFiles)/elapsed.Seconds())
+
+	// Verify all files are now TEMP_DELETED
+	verifyCount := 0
+	for key := range entries {
+		meta, err := c.Get(key)
+		require.NoError(t, err)
+		require.Equal(t, model.StatusTempDeleted, meta.Status)
+		verifyCount++
+		// Sample verification - don't verify all to keep test fast
+		if verifyCount >= 100 {
+			break
+		}
+	}
+}
+
+func TestFinalizeStatesAfterScan_NoDeadlock_MultipleBatches(t *testing.T) {
+	c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	// Create MORE entries than the batch size (10,000) to ensure multiple batches
+	numFiles := 25000
+	entries := make(map[string]model.FileMeta)
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("file%05d", i)
+		entries[key] = model.FileMeta{
+			Hash:    fmt.Sprintf("hash%d", i),
+			Size:    int64(i),
+			ModTime: int64(i * 1000),
+			Status:  model.StatusTempDeleted,
+		}
+	}
+	require.NoError(t, c.BatchSet(entries))
+
+	r := NewRunner(c, nil, nil, nil, false)
+
+	// Use a timeout context to detect deadlocks
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// This should complete without hanging
+	start := time.Now()
+	stats, err := r.finalizeStatesAfterScan(ctx)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "finalizeStatesAfterScan should not deadlock")
+	require.NotNil(t, stats)
+	require.Equal(t, int64(numFiles), stats.TotalProcessed)
+	require.Equal(t, int64(numFiles), stats.TempDeletedToDeletedS3)
+
+	t.Logf("FinalizeStatesAfterScan processed %d files in %v (%.0f files/sec)",
+		numFiles, elapsed, float64(numFiles)/elapsed.Seconds())
+
+	// Verify all files are now DELETED_ON_S3
+	verifyCount := 0
+	for key := range entries {
+		meta, err := c.Get(key)
+		require.NoError(t, err)
+		require.Equal(t, model.StatusDeletedInSource, meta.Status)
+		verifyCount++
+		// Sample verification - don't verify all to keep test fast
+		if verifyCount >= 100 {
+			break
+		}
+	}
+}
+
+func TestPrepareForScan_NoDeadlock_ExactlyOneBatch(t *testing.T) {
+	c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	// Test edge case: exactly one batch (batchSize = 10,000)
+	numFiles := 10000
+	entries := make(map[string]model.FileMeta)
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("file%05d", i)
+		entries[key] = model.FileMeta{
+			Hash:    fmt.Sprintf("hash%d", i),
+			Size:    int64(i),
+			ModTime: int64(i * 1000),
+			Status:  model.StatusSynced,
+		}
+	}
+	require.NoError(t, c.BatchSet(entries))
+
+	r := NewRunner(c, nil, nil, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stats, err := r.prepareForScan(ctx)
+	require.NoError(t, err, "prepareForScan should not deadlock with exactly one batch")
+	require.Equal(t, int64(numFiles), stats.TotalProcessed)
+	require.Equal(t, int64(numFiles), stats.SyncedToTempDeleted)
+}
+
+func TestPrepareForScan_NoDeadlock_JustOverOneBatch(t *testing.T) {
+	c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	// Test edge case: just over one batch (10,001 files)
+	// This ensures the second batch is processed correctly
+	numFiles := 10001
+	entries := make(map[string]model.FileMeta)
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("file%05d", i)
+		entries[key] = model.FileMeta{
+			Hash:    fmt.Sprintf("hash%d", i),
+			Size:    int64(i),
+			ModTime: int64(i * 1000),
+			Status:  model.StatusSynced,
+		}
+	}
+	require.NoError(t, c.BatchSet(entries))
+
+	r := NewRunner(c, nil, nil, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stats, err := r.prepareForScan(ctx)
+	require.NoError(t, err, "prepareForScan should not deadlock with just over one batch")
+	require.Equal(t, int64(numFiles), stats.TotalProcessed)
+	require.Equal(t, int64(numFiles), stats.SyncedToTempDeleted)
+}
+
+func TestFinalizeStatesAfterScan_NoDeadlock_MixedStatusesMultipleBatches(t *testing.T) {
+	c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	// Test with mixed statuses across multiple batches
+	numFiles := 15000
+	entries := make(map[string]model.FileMeta)
+	expectedTempDeleted := int64(0)
+
+	for i := 0; i < numFiles; i++ {
+		key := fmt.Sprintf("file%05d", i)
+		var status model.FileStatus
+		// Mix of statuses
+		switch i % 5 {
+		case 0:
+			status = model.StatusTempDeleted
+			expectedTempDeleted++
+		case 1:
+			status = model.StatusSynced
+		case 2:
+			status = model.StatusNew
+		case 3:
+			status = model.StatusDeletedInSource
+		case 4:
+			status = model.StatusError
+		}
+
+		entries[key] = model.FileMeta{
+			Hash:    fmt.Sprintf("hash%d", i),
+			Size:    int64(i),
+			ModTime: int64(i * 1000),
+			Status:  status,
+		}
+	}
+	require.NoError(t, c.BatchSet(entries))
+
+	r := NewRunner(c, nil, nil, nil, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	stats, err := r.finalizeStatesAfterScan(ctx)
+	require.NoError(t, err, "finalizeStatesAfterScan should not deadlock with mixed statuses")
+	require.Equal(t, int64(numFiles), stats.TotalProcessed)
+	require.Equal(t, expectedTempDeleted, stats.TempDeletedToDeletedS3)
+}
+
+func TestPrepareForScan_TimeoutDetectsHang(t *testing.T) {
+	c, cleanup := newTestCache(t)
+	defer cleanup()
+
+	// Add some files
+	entries := map[string]model.FileMeta{
+		"file1": {Hash: "h1", Size: 100, ModTime: 1000, Status: model.StatusSynced},
+	}
+	require.NoError(t, c.BatchSet(entries))
+
+	r := NewRunner(c, nil, nil, nil, false)
+
+	// First, verify the function completes normally (without artificial delay)
+	stats, err := r.prepareForScan(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, stats)
+
+	// Now test that a cancelled context is properly detected
+	// (This validates our timeout detection would work if there was a hang)
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	_, err = r.prepareForScan(cancelledCtx)
+	require.Error(t, err, "Should detect cancelled context")
+	require.Equal(t, context.Canceled, err)
 }
