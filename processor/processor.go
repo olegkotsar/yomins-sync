@@ -190,6 +190,10 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 	batchSize := 10000
 	batchCh, errCh := r.cache.IterateBatches(ctx, batchSize)
 
+	// Collect all updates first to avoid deadlock with IterateBatches
+	// (IterateBatches holds a read lock, BatchSet needs a write lock)
+	allUpdates := make(map[string]model.FileMeta)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -198,15 +202,20 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 			if ok && err != nil {
 				return stats, err
 			}
+			// When errCh is closed without error, continue to drain batchCh
 		case batch, ok := <-batchCh:
 			if !ok {
-				// All batches processed successfully
+				// All batches received, now apply updates
+				if len(allUpdates) > 0 {
+					r.logger.Debug("Applying %d updates to cache...", len(allUpdates))
+					if err := r.cache.BatchSet(allUpdates); err != nil {
+						return stats, err
+					}
+				}
 				return stats, nil
 			}
 
-			// Prepare updates map for files that need status change
-			updates := make(map[string]model.FileMeta)
-
+			// Collect updates from this batch
 			for key, meta := range batch {
 				stats.TotalProcessed++
 
@@ -214,7 +223,7 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 				case model.StatusSynced:
 					// Change SYNCED to TEMP_DELETED
 					meta.Status = model.StatusTempDeleted
-					updates[key] = meta
+					allUpdates[key] = meta
 					stats.SyncedToTempDeleted++
 				case model.StatusNew:
 					stats.NewRemained++
@@ -224,13 +233,6 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 					stats.TempDeletedRemained++
 				case model.StatusError:
 					stats.ErrorRemained++
-				}
-			}
-
-			// Apply updates if any
-			if len(updates) > 0 {
-				if err := r.cache.BatchSet(updates); err != nil {
-					return stats, err
 				}
 			}
 		}
@@ -243,6 +245,10 @@ func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesSt
 	batchSize := 10000
 	batchCh, errCh := r.cache.IterateBatches(ctx, batchSize)
 
+	// Collect all updates first to avoid deadlock with IterateBatches
+	// (IterateBatches holds a read lock, BatchSet needs a write lock)
+	allUpdates := make(map[string]model.FileMeta)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -251,15 +257,20 @@ func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesSt
 			if ok && err != nil {
 				return stats, err
 			}
+			// When errCh is closed without error, continue to drain batchCh
 		case batch, ok := <-batchCh:
 			if !ok {
-				// All batches processed successfully
+				// All batches received, now apply updates
+				if len(allUpdates) > 0 {
+					r.logger.Debug("Applying %d updates to cache...", len(allUpdates))
+					if err := r.cache.BatchSet(allUpdates); err != nil {
+						return stats, err
+					}
+				}
 				return stats, nil
 			}
 
-			// Prepare updates map for files that need status change
-			updates := make(map[string]model.FileMeta)
-
+			// Collect updates from this batch
 			for key, meta := range batch {
 				stats.TotalProcessed++
 
@@ -268,7 +279,7 @@ func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesSt
 					// Change TEMP_DELETED to DELETED_ON_S3
 					// (these files were not found during source scan)
 					meta.Status = model.StatusDeletedInSource
-					updates[key] = meta
+					allUpdates[key] = meta
 					stats.TempDeletedToDeletedS3++
 				case model.StatusSynced:
 					stats.SyncedRemained++
@@ -278,13 +289,6 @@ func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesSt
 					stats.DeletedOnS3Remained++
 				case model.StatusError:
 					stats.ErrorRemained++
-				}
-			}
-
-			// Apply updates if any
-			if len(updates) > 0 {
-				if err := r.cache.BatchSet(updates); err != nil {
-					return stats, err
 				}
 			}
 		}
