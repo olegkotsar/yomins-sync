@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +22,25 @@ type Runner struct {
 	destination destination.DestinationProvider
 	logger      logger.Logger
 	dryRun      bool
+}
+
+// logMemStats logs detailed memory statistics for debugging memory issues
+func (r *Runner) logMemStats(label string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	r.logger.Debug("[MEMSTATS:%s] Alloc=%dMB TotalAlloc=%dMB Sys=%dMB HeapInuse=%dMB HeapIdle=%dMB HeapObjects=%d StackInuse=%dMB NumGC=%d NextGC=%dMB",
+		label,
+		m.Alloc/1024/1024,        // Currently allocated heap memory
+		m.TotalAlloc/1024/1024,   // Cumulative allocated (doesn't decrease)
+		m.Sys/1024/1024,          // Total memory from OS
+		m.HeapInuse/1024/1024,    // Heap memory in use
+		m.HeapIdle/1024/1024,     // Heap memory idle (can be returned to OS)
+		m.HeapObjects,            // Number of allocated objects
+		m.StackInuse/1024/1024,   // Stack memory in use
+		m.NumGC,                  // Number of GC runs
+		m.NextGC/1024/1024,       // Next GC will run when Alloc reaches this
+	)
 }
 
 // NewRunner creates a new Runner with the provided dependencies
@@ -187,12 +208,21 @@ func (r *Runner) Run(ctx context.Context) error {
 // prepareForScan sets all SYNCED files to TEMP_DELETED and keeps others as is
 func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, error) {
 	stats := &PrepareForScanStats{}
-	batchSize := 10000
-	batchCh, errCh := r.cache.IterateBatches(ctx, batchSize)
+	// Reduced batch sizes to minimize memory footprint
+	readBatchSize := 1000  // Reduced from 10000 to prevent batch accumulation
+	writeBatchSize := 500  // Reduced from 1000 for more frequent commits
 
-	// Collect all updates first to avoid deadlock with IterateBatches
-	// (IterateBatches holds a read lock, BatchSet needs a write lock)
-	allUpdates := make(map[string]model.FileMeta)
+	r.logMemStats("START_PREPARE_SCAN")
+
+	batchCh, errCh := r.cache.IterateBatches(ctx, readBatchSize)
+
+	// Incremental updates map (no longer collecting all in memory!)
+	updates := make(map[string]model.FileMeta, writeBatchSize)
+
+	// Track memory usage patterns
+	batchCount := 0
+	writeCount := 0
+	estimatedBatchBytes := 0
 
 	for {
 		select {
@@ -205,17 +235,45 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 			// When errCh is closed without error, continue to drain batchCh
 		case batch, ok := <-batchCh:
 			if !ok {
-				// All batches received, now apply updates
-				if len(allUpdates) > 0 {
-					r.logger.Debug("Applying %d updates to cache...", len(allUpdates))
-					if err := r.cache.BatchSet(allUpdates); err != nil {
+				// All batches received, commit any remaining updates
+				if len(updates) > 0 {
+					r.logger.Debug("Applying final %d updates to cache...", len(updates))
+					if err := r.cache.BatchSet(updates); err != nil {
 						return stats, err
 					}
+					writeCount++
 				}
+
+				r.logger.Debug("PrepareForScan: processed %d batches, wrote %d times, total entries=%d",
+					batchCount, writeCount, stats.TotalProcessed)
+				r.logMemStats("BEFORE_GC")
+
+				// Force memory cleanup after processing millions of entries
+				runtime.GC()
+				debug.FreeOSMemory()
+
+				r.logMemStats("AFTER_GC")
+
 				return stats, nil
 			}
 
-			// Collect updates from this batch
+			batchCount++
+
+			// Estimate batch memory usage
+			estimatedBatchBytes = 0
+			for key := range batch {
+				// Estimate: key + FileMeta + map overhead
+				estimatedBatchBytes += len(key) + 72 + 32 // FileMeta ~72 bytes, map overhead ~32 bytes
+			}
+
+			// Log every 1000 batches or when memory profiling is helpful
+			if batchCount%1000 == 0 {
+				r.logger.Debug("Received batch %d: size=%d entries, est_bytes=%d KB",
+					batchCount, len(batch), estimatedBatchBytes/1024)
+				r.logMemStats(fmt.Sprintf("AFTER_BATCH_%d", batchCount))
+			}
+
+			// Process this batch
 			for key, meta := range batch {
 				stats.TotalProcessed++
 
@@ -223,7 +281,7 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 				case model.StatusSynced:
 					// Change SYNCED to TEMP_DELETED
 					meta.Status = model.StatusTempDeleted
-					allUpdates[key] = meta
+					updates[key] = meta
 					stats.SyncedToTempDeleted++
 				case model.StatusNew:
 					stats.NewRemained++
@@ -234,6 +292,28 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 				case model.StatusError:
 					stats.ErrorRemained++
 				}
+
+				// Commit updates incrementally to avoid memory buildup
+				if len(updates) >= writeBatchSize {
+					writeCount++
+					r.logger.Debug("Applying %d updates to cache... (write #%d)", len(updates), writeCount)
+
+					// Log memory before write (every 100 writes to avoid spam)
+					if writeCount%100 == 0 {
+						r.logMemStats(fmt.Sprintf("BEFORE_WRITE_%d", writeCount))
+					}
+
+					if err := r.cache.BatchSet(updates); err != nil {
+						return stats, err
+					}
+
+					// Log memory after write to see if it's freed
+					if writeCount%100 == 0 {
+						r.logMemStats(fmt.Sprintf("AFTER_WRITE_%d", writeCount))
+					}
+
+					updates = make(map[string]model.FileMeta, writeBatchSize)
+				}
 			}
 		}
 	}
@@ -242,12 +322,20 @@ func (r *Runner) prepareForScan(ctx context.Context) (*PrepareForScanStats, erro
 // finalizeStatesAfterScan marks TEMP_DELETED as DELETED_ON_S3 if they were not seen in the source
 func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesStats, error) {
 	stats := &FinalizeStatesStats{}
-	batchSize := 10000
-	batchCh, errCh := r.cache.IterateBatches(ctx, batchSize)
+	// Reduced batch sizes to minimize memory footprint
+	readBatchSize := 1000  // Reduced from 10000 to prevent batch accumulation
+	writeBatchSize := 500  // Reduced from 1000 for more frequent commits
 
-	// Collect all updates first to avoid deadlock with IterateBatches
-	// (IterateBatches holds a read lock, BatchSet needs a write lock)
-	allUpdates := make(map[string]model.FileMeta)
+	r.logMemStats("START_FINALIZE_SCAN")
+
+	batchCh, errCh := r.cache.IterateBatches(ctx, readBatchSize)
+
+	// Incremental updates map (no longer collecting all in memory!)
+	updates := make(map[string]model.FileMeta, writeBatchSize)
+
+	// Track memory usage patterns
+	batchCount := 0
+	writeCount := 0
 
 	for {
 		select {
@@ -260,17 +348,37 @@ func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesSt
 			// When errCh is closed without error, continue to drain batchCh
 		case batch, ok := <-batchCh:
 			if !ok {
-				// All batches received, now apply updates
-				if len(allUpdates) > 0 {
-					r.logger.Debug("Applying %d updates to cache...", len(allUpdates))
-					if err := r.cache.BatchSet(allUpdates); err != nil {
+				// All batches received, commit any remaining updates
+				if len(updates) > 0 {
+					r.logger.Debug("Applying final %d updates to cache...", len(updates))
+					if err := r.cache.BatchSet(updates); err != nil {
 						return stats, err
 					}
+					writeCount++
 				}
+
+				r.logger.Debug("FinalizeStates: processed %d batches, wrote %d times, total entries=%d",
+					batchCount, writeCount, stats.TotalProcessed)
+				r.logMemStats("BEFORE_GC")
+
+				// Force memory cleanup after processing millions of entries
+				runtime.GC()
+				debug.FreeOSMemory()
+
+				r.logMemStats("AFTER_GC")
+
 				return stats, nil
 			}
 
-			// Collect updates from this batch
+			batchCount++
+
+			// Log every 1000 batches
+			if batchCount%1000 == 0 {
+				r.logger.Debug("Received batch %d: size=%d entries", batchCount, len(batch))
+				r.logMemStats(fmt.Sprintf("AFTER_BATCH_%d", batchCount))
+			}
+
+			// Process this batch
 			for key, meta := range batch {
 				stats.TotalProcessed++
 
@@ -279,7 +387,7 @@ func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesSt
 					// Change TEMP_DELETED to DELETED_ON_S3
 					// (these files were not found during source scan)
 					meta.Status = model.StatusDeletedInSource
-					allUpdates[key] = meta
+					updates[key] = meta
 					stats.TempDeletedToDeletedS3++
 				case model.StatusSynced:
 					stats.SyncedRemained++
@@ -289,6 +397,27 @@ func (r *Runner) finalizeStatesAfterScan(ctx context.Context) (*FinalizeStatesSt
 					stats.DeletedOnS3Remained++
 				case model.StatusError:
 					stats.ErrorRemained++
+				}
+
+				// Commit updates incrementally to avoid memory buildup
+				if len(updates) >= writeBatchSize {
+					writeCount++
+					r.logger.Debug("Applying %d updates to cache... (write #%d)", len(updates), writeCount)
+
+					// Log memory before/after write (every 100 writes)
+					if writeCount%100 == 0 {
+						r.logMemStats(fmt.Sprintf("BEFORE_WRITE_%d", writeCount))
+					}
+
+					if err := r.cache.BatchSet(updates); err != nil {
+						return stats, err
+					}
+
+					if writeCount%100 == 0 {
+						r.logMemStats(fmt.Sprintf("AFTER_WRITE_%d", writeCount))
+					}
+
+					updates = make(map[string]model.FileMeta, writeBatchSize)
 				}
 			}
 		}

@@ -183,7 +183,8 @@ func (c *BboltCache) Count() (int64, error) {
 	return count, err
 }
 
-// IterateBatches streams cache entries in batches of the specified size
+// IterateBatches streams cache entries in batches of the specified size.
+// Uses short-lived sequential transactions to allow interleaved write operations.
 func (c *BboltCache) IterateBatches(ctx context.Context, batchSize int) (<-chan map[string]model.FileMeta, <-chan error) {
 	batchCh := make(chan map[string]model.FileMeta)
 	errCh := make(chan error, 1)
@@ -192,57 +193,89 @@ func (c *BboltCache) IterateBatches(ctx context.Context, batchSize int) (<-chan 
 		defer close(batchCh)
 		defer close(errCh)
 
-		err := c.db.View(func(tx *bbolt.Tx) error {
-			b := tx.Bucket([]byte(c.bucket))
-			if b == nil {
-				return ErrBucketNotFound
+		var nextKey []byte = nil // Position tracker for resuming iteration
+
+		for {
+			// Read one batch in a short-lived transaction
+			batch, resumeKey, err := c.readOneBatch(ctx, nextKey, batchSize)
+			if err != nil {
+				errCh <- err
+				return
 			}
 
-			batch := make(map[string]model.FileMeta, batchSize)
-			cursor := b.Cursor()
-
-			for k, v := cursor.First(); k != nil; k, v = cursor.Next() {
-				// Check context cancellation
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				default:
-				}
-
-				var meta model.FileMeta
-				if err := json.Unmarshal(v, &meta); err != nil {
-					return fmt.Errorf("unmarshal error for key %s: %w", k, err)
-				}
-
-				batch[string(k)] = meta
-
-				// Send batch when it reaches the specified size
-				if len(batch) >= batchSize {
-					select {
-					case batchCh <- batch:
-						batch = make(map[string]model.FileMeta, batchSize)
-					case <-ctx.Done():
-						return ctx.Err()
-					}
-				}
+			// If batch is empty, iteration is complete
+			if len(batch) == 0 {
+				return
 			}
 
-			// Send remaining entries if any
-			if len(batch) > 0 {
-				select {
-				case batchCh <- batch:
-				case <-ctx.Done():
-					return ctx.Err()
+			// Send batch to consumer (transaction is already closed at this point)
+			select {
+			case batchCh <- batch:
+				// If resumeKey is nil, we've reached the end of iteration
+				if resumeKey == nil {
+					return
 				}
+				nextKey = resumeKey // Save position for next iteration
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
 			}
-
-			return nil
-		})
-
-		if err != nil {
-			errCh <- err
 		}
 	}()
 
 	return batchCh, errCh
+}
+
+// readOneBatch reads a single batch of entries in a short-lived transaction.
+// Returns the batch, the next key to resume from, and any error.
+func (c *BboltCache) readOneBatch(ctx context.Context, startKey []byte, batchSize int) (
+	batch map[string]model.FileMeta,
+	nextKey []byte,
+	err error,
+) {
+	batch = make(map[string]model.FileMeta, batchSize)
+
+	err = c.db.View(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(c.bucket))
+		if b == nil {
+			return ErrBucketNotFound
+		}
+
+		cursor := b.Cursor()
+
+		// Position cursor at start key
+		var k, v []byte
+		if startKey == nil {
+			k, v = cursor.First()
+		} else {
+			k, v = cursor.Seek(startKey)
+		}
+
+		// Read up to batchSize entries
+		for ; k != nil && len(batch) < batchSize; k, v = cursor.Next() {
+			// Check context cancellation
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			var meta model.FileMeta
+			if err := json.Unmarshal(v, &meta); err != nil {
+				return fmt.Errorf("unmarshal error for key %s: %w", k, err)
+			}
+
+			batch[string(k)] = meta
+		}
+
+		// Save next key for resuming iteration
+		// IMPORTANT: Must deep copy the key because bbolt keys are only valid during the transaction
+		if k != nil {
+			nextKey = append([]byte(nil), k...)
+		}
+
+		return nil
+	}) // Transaction closes here - read lock is released!
+
+	return batch, nextKey, err
 }
