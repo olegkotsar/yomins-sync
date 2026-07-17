@@ -43,6 +43,7 @@ BBolt mmap overhead:  ~3 GB virtual memory (not a problem)
 8. [Production Deployment Guide](#production-deployment-guide)
 9. [Troubleshooting Guide](#troubleshooting-guide)
 10. [Technical Reference](#technical-reference)
+11. [Solution Round 4: Streaming Upload & Delete Phases](#solution-round-4-streaming-upload--delete-phases)
 
 ---
 
@@ -1255,7 +1256,41 @@ The journey from 6.5 GB to 78 MB demonstrates the importance of:
 
 ---
 
-**Document Version:** 1.0 - Consolidated Final
-**Last Updated:** November 6, 2025
-**Status:** Complete - No Further Action Required
+## Solution Round 4: Streaming Upload & Delete Phases
+
+### Problem (July 2026)
+
+Rounds 1–3 optimized only the scan/state phases (`prepareForScan`, `finalizeStatesAfterScan`). During a production sync of ~9.9M files the process consumed ~4 GB RSS in the **upload phase** — and unlike the mmap RSS analyzed in Round 3, this was real anonymous heap the OS could not evict:
+
+- `syncNewFilesActual` collected **all** NEW files into a `map[string]model.FileMeta` before starting workers (~2.4 GB for 9.9M entries)
+- The `jobs` and `results` channels were buffered to `len(newFiles)` (~1 GB more), and the jobs channel was fully pre-filled
+- `deleteRemovedFilesActual` had the same collect-everything pattern for DELETED_ON_S3 files
+
+### Fix
+
+Both phases now stream directly from `IterateBatches` (the same short-lived-transaction iteration from Round 1), so heap stays constant regardless of file count:
+
+- **Upload phase** (`processor/processor.go`, `syncNewFilesActual`):
+  1. A counting pass computes totals for stats and progress percentage (O(1) memory)
+  2. A producer goroutine streams NEW files into a small `jobs` channel (buffer = `workerCount*2`); `results` is equally small, giving backpressure end to end
+  3. The collector batches cache updates every 100 files, as before
+
+  Interleaving `IterateBatches` with `BatchSet` is safe: iteration is forward-only and only already-dispatched keys are updated.
+- **Delete phase** (`deleteRemovedFilesActual`): files are deleted from the destination while scanning; cache removals are flushed in batches of 1,000 via the new `BatchDelete` (single transaction per batch — also ~250× faster than the previous per-key `Delete` loop).
+
+### Results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Upload-phase heap, 9.9M NEW files | ~3.3 GB | tens of MB |
+| Measured peak heap, 200k NEW files (`TestSyncNewFilesActual_MemoryUsage`) | ~60+ MB | **8.9 MB** |
+| Cache removals, 25k deleted files | ~375 keys/sec | ~95,000 keys/sec |
+
+Regression tests: `TestSyncNewFilesActual_NoDeadlock_MultipleBatches`, `TestDeleteRemovedFilesActual_NoDeadlock_MultipleBatches`, `TestSyncNewFilesActual_MemoryUsage` (`processor/streaming_test.go`).
+
+---
+
+**Document Version:** 2.0 - Includes Round 4 (streaming upload/delete phases)
+**Last Updated:** July 17, 2026
+**Status:** Complete
 **Authors:** Solution Implementation Team

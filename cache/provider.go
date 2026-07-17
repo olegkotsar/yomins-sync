@@ -13,6 +13,8 @@ type CacheProvider interface {
 	Set(key string, meta model.FileMeta) error
 	Get(key string) (*model.FileMeta, error)
 	BatchSet(entries map[string]model.FileMeta) error
+	// BatchDelete removes multiple keys in a single transaction; missing keys are ignored
+	BatchDelete(keys []string) error
 	GetByPrefix(prefix string) (map[string]model.FileMeta, error)
 	DumpAll() (map[string]model.FileMeta, error)
 	Delete(key string) error

@@ -29,7 +29,9 @@ func NewBboltCache(cfg *config.BboltConfig) (*BboltCache, error) {
 	}
 
 	// Open bbolt database
-	db, err := bbolt.Open(cfg.Path, cfg.Mode, nil)
+	db, err := bbolt.Open(cfg.Path, cfg.Mode, &bbolt.Options{
+		NoSync: cfg.NoSync,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -168,6 +170,23 @@ func (c *BboltCache) Delete(key string) error {
 
 		// Delete the key
 		return b.Delete([]byte(key))
+	})
+}
+
+// BatchDelete removes multiple keys in a single transaction.
+// Missing keys are ignored so the operation is idempotent.
+func (c *BboltCache) BatchDelete(keys []string) error {
+	return c.db.Update(func(tx *bbolt.Tx) error {
+		b := tx.Bucket([]byte(c.bucket))
+		if b == nil {
+			return ErrBucketNotFound
+		}
+		for _, key := range keys {
+			if err := b.Delete([]byte(key)); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

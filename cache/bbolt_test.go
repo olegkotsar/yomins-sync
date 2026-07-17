@@ -290,6 +290,7 @@ func TestIterateBatches_ContextCancellation(t *testing.T) {
 	require.NoError(t, c.BatchSet(entries))
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	batchCh, errCh := c.IterateBatches(ctx, 10)
 
 	batchCount := 0
@@ -411,6 +412,41 @@ func TestDelete(t *testing.T) {
 	all, err := c.DumpAll()
 	require.NoError(t, err)
 	require.Empty(t, all)
+}
+
+func TestBatchDelete(t *testing.T) {
+	c, cleanup := newTestBboltCache(t)
+	defer cleanup()
+
+	// Add test entries
+	entries := map[string]model.FileMeta{
+		"file1": {Hash: "hash1", ModTime: 100, Size: 10},
+		"file2": {Hash: "hash2", ModTime: 200, Size: 20},
+		"file3": {Hash: "hash3", ModTime: 300, Size: 30},
+	}
+	require.NoError(t, c.BatchSet(entries))
+
+	// Delete two keys plus a non-existent one (missing keys are ignored)
+	err := c.BatchDelete([]string{"file1", "file3", "nonexistent"})
+	require.NoError(t, err)
+
+	// Verify deleted keys are gone
+	_, err = c.Get("file1")
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	_, err = c.Get("file3")
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	// Verify remaining key is intact
+	got, err := c.Get("file2")
+	require.NoError(t, err)
+	require.Equal(t, entries["file2"], *got)
+
+	// Empty batch is a no-op
+	require.NoError(t, c.BatchDelete(nil))
+
+	count, err := c.Count()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), count)
 }
 
 func TestCount(t *testing.T) {

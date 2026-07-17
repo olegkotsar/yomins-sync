@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -616,14 +617,17 @@ func (r *Runner) syncNewFilesDryRun(ctx context.Context, stats *SyncNewFilesStat
 	}
 }
 
-// syncNewFilesActual performs actual parallel upload of NEW files
+// syncNewFilesActual performs actual parallel upload of NEW files.
+// NEW files are streamed from the cache into a small bounded job queue instead
+// of being collected in memory, so heap usage stays constant regardless of how
+// many files need to be uploaded.
 func (r *Runner) syncNewFilesActual(ctx context.Context, stats *SyncNewFilesStats) (*SyncNewFilesStats, error) {
-	// Step 1: Collect all NEW files from cache
-	r.logger.Debug("Collecting NEW files from cache...")
-	newFiles := make(map[string]model.FileMeta)
+	// Step 1: Count NEW files (O(1) memory) so progress logging knows the total
+	r.logger.Debug("Counting NEW files in cache...")
 	batchSize := 10000
 	batchCh, errCh := r.cache.IterateBatches(ctx, batchSize)
 
+CountLoop:
 	for {
 		select {
 		case <-ctx.Done():
@@ -634,16 +638,15 @@ func (r *Runner) syncNewFilesActual(ctx context.Context, stats *SyncNewFilesStat
 			}
 		case batch, ok := <-batchCh:
 			if !ok {
-				goto StartUpload
+				break CountLoop
 			}
 
-			for key, meta := range batch {
+			for _, meta := range batch {
 				stats.TotalScanned++
 
 				if meta.Status == model.StatusNew {
 					stats.NewFilesFound++
 					stats.TotalSizeBytes += meta.Size
-					newFiles[key] = meta
 				} else {
 					stats.OtherStatuses++
 				}
@@ -651,15 +654,14 @@ func (r *Runner) syncNewFilesActual(ctx context.Context, stats *SyncNewFilesStat
 		}
 	}
 
-StartUpload:
 	// Step 2: If no NEW files, return early
-	if len(newFiles) == 0 {
+	if stats.NewFilesFound == 0 {
 		r.logger.Info("No NEW files to sync")
 		return stats, nil
 	}
 
 	r.logger.Info("Found %d NEW files to sync (total size: %.2f MB)",
-		len(newFiles), float64(stats.TotalSizeBytes)/(1024*1024))
+		stats.NewFilesFound, float64(stats.TotalSizeBytes)/(1024*1024))
 
 	// Step 3: Set up worker pool for parallel uploads
 	workerCount := r.destination.GetWorkerCount()
@@ -674,12 +676,16 @@ StartUpload:
 
 	type uploadResult struct {
 		key     string
+		meta    model.FileMeta
 		success bool
 		err     error
 	}
 
-	jobs := make(chan uploadJob, len(newFiles))
-	results := make(chan uploadResult, len(newFiles))
+	// Small buffers provide backpressure: the producer reads from the cache
+	// only as fast as workers consume jobs.
+	jobs := make(chan uploadJob, workerCount*2)
+	results := make(chan uploadResult, workerCount*2)
+	producerErrCh := make(chan error, 1)
 
 	// Step 4: Start workers
 	workerCtx, cancel := context.WithCancel(ctx)
@@ -687,23 +693,21 @@ StartUpload:
 
 	r.logger.Debug("Starting %d upload workers...", workerCount)
 
+	var wg sync.WaitGroup
 	for w := 0; w < workerCount; w++ {
+		wg.Add(1)
 		go func(workerID int) {
+			defer wg.Done()
 			for job := range jobs {
-				select {
-				case <-workerCtx.Done():
-					results <- uploadResult{key: job.key, success: false, err: workerCtx.Err()}
-					return
-				default:
-					// Download from S3
-					r.logger.Verbose("[Worker %d] Downloading %s from source...", workerID, job.key)
-					reader, err := r.source.GetObject(workerCtx, job.key)
-					if err != nil {
-						r.logger.Error("[Worker %d] Failed to download %s: %v", workerID, job.key, err)
-						results <- uploadResult{key: job.key, success: false, err: err}
-						continue
-					}
+				result := uploadResult{key: job.key, meta: job.meta}
 
+				// Download from S3
+				r.logger.Verbose("[Worker %d] Downloading %s from source...", workerID, job.key)
+				reader, err := r.source.GetObject(workerCtx, job.key)
+				if err != nil {
+					r.logger.Error("[Worker %d] Failed to download %s: %v", workerID, job.key, err)
+					result.err = err
+				} else {
 					// Upload to destination
 					r.logger.Verbose("[Worker %d] Uploading %s to destination...", workerID, job.key)
 					err = r.destination.Upload(workerCtx, job.key, reader)
@@ -715,30 +719,69 @@ StartUpload:
 
 					if err != nil {
 						r.logger.Error("[Worker %d] Failed to upload %s: %v", workerID, job.key, err)
-						results <- uploadResult{key: job.key, success: false, err: err}
-						continue
+						result.err = err
+					} else {
+						r.logger.Debug("[Worker %d] Successfully uploaded %s", workerID, job.key)
+						result.success = true
 					}
+				}
 
-					r.logger.Debug("[Worker %d] Successfully uploaded %s", workerID, job.key)
-					results <- uploadResult{key: job.key, success: true, err: nil}
+				select {
+				case results <- result:
+				case <-workerCtx.Done():
+					return
 				}
 			}
 		}(w)
 	}
 
-	// Step 5: Send jobs to workers
-	r.logger.Debug("Sending %d files to upload queue...", len(newFiles))
-	for key, meta := range newFiles {
-		jobs <- uploadJob{key: key, meta: meta}
-	}
-	close(jobs)
+	// Close results once all workers are done
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Step 5: Stream NEW files from cache to workers.
+	// Interleaving IterateBatches with BatchSet is safe: iteration uses
+	// short-lived read transactions and only already-dispatched keys are
+	// updated, which never moves the forward-only resume position.
+	go func() {
+		defer close(jobs)
+		batchCh, errCh := r.cache.IterateBatches(workerCtx, batchSize)
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case err, ok := <-errCh:
+				if ok && err != nil {
+					producerErrCh <- err
+					return
+				}
+			case batch, ok := <-batchCh:
+				if !ok {
+					return
+				}
+
+				for key, meta := range batch {
+					if meta.Status != model.StatusNew {
+						continue
+					}
+					select {
+					case jobs <- uploadJob{key: key, meta: meta}:
+					case <-workerCtx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
 
 	// Step 6: Collect results and update cache
 	r.logger.Debug("Waiting for upload results...")
 	updates := make(map[string]model.FileMeta)
 
 	// Start periodic progress logging
-	totalFiles := int64(len(newFiles))
+	totalFiles := stats.NewFilesFound
 	var processedFiles int64
 
 	progressTicker := time.NewTicker(1 * time.Second)
@@ -762,13 +805,18 @@ StartUpload:
 		}
 	}()
 
-	for i := 0; i < len(newFiles); i++ {
+CollectLoop:
+	for {
 		select {
 		case <-ctx.Done():
 			cancel()
 			return stats, ctx.Err()
-		case result := <-results:
-			meta := newFiles[result.key]
+		case result, ok := <-results:
+			if !ok {
+				break CollectLoop
+			}
+
+			meta := result.meta
 
 			if result.success {
 				// Update status to SYNCED
@@ -802,6 +850,13 @@ StartUpload:
 		if err := r.cache.BatchSet(updates); err != nil {
 			return stats, fmt.Errorf("failed to update cache: %w", err)
 		}
+	}
+
+	// Surface a cache iteration error from the producer, if any
+	select {
+	case err := <-producerErrCh:
+		return stats, fmt.Errorf("failed to iterate cache: %w", err)
+	default:
 	}
 
 	r.logger.Info("Upload completed: %d succeeded, %d failed", stats.SuccessfullySynced, stats.FailedToSync)
@@ -886,81 +941,85 @@ func (r *Runner) deleteRemovedFilesDryRun(ctx context.Context, stats *DeleteRemo
 	}
 }
 
-// deleteRemovedFilesActual performs actual deletion of DELETED_ON_S3 files
+// deleteRemovedFilesActual performs actual deletion of DELETED_ON_S3 files.
+// Files are deleted while streaming the cache, and cache removals are flushed
+// in small batches, so heap usage stays constant regardless of how many files
+// were deleted in the source.
 func (r *Runner) deleteRemovedFilesActual(ctx context.Context, stats *DeleteRemovedFilesStats) (*DeleteRemovedFilesStats, error) {
-	// Step 1: Collect all DELETED_ON_S3 files from cache
-	r.logger.Debug("Collecting DELETED_ON_S3 files from cache...")
-	deletedFiles := make(map[string]model.FileMeta)
+	r.logger.Debug("Scanning cache for DELETED_ON_S3 files...")
 	batchSize := 10000
 	batchCh, errCh := r.cache.IterateBatches(ctx, batchSize)
 
+	// Removing already-visited keys is safe during iteration: the resume key
+	// always points at a not-yet-processed entry.
+	const removeFlushSize = 1000
+	keysToRemove := make([]string, 0, removeFlushSize)
+	flushRemovals := func() {
+		if len(keysToRemove) == 0 {
+			return
+		}
+		r.logger.Debug("Removing %d successfully deleted files from cache...", len(keysToRemove))
+		if err := r.cache.BatchDelete(keysToRemove); err != nil {
+			r.logger.Warn("Failed to remove %d keys from cache: %v", len(keysToRemove), err)
+		}
+		keysToRemove = keysToRemove[:0]
+	}
+
+ScanLoop:
 	for {
 		select {
 		case <-ctx.Done():
+			flushRemovals()
 			return stats, ctx.Err()
 		case err, ok := <-errCh:
 			if ok && err != nil {
+				flushRemovals()
 				return stats, err
 			}
 		case batch, ok := <-batchCh:
 			if !ok {
-				goto StartDeletion
+				break ScanLoop
 			}
 
 			for key, meta := range batch {
+				if ctx.Err() != nil {
+					flushRemovals()
+					return stats, ctx.Err()
+				}
+
 				stats.TotalScanned++
 
-				if meta.Status == model.StatusDeletedInSource {
-					stats.DeletedOnS3Found++
-					deletedFiles[key] = meta
-				} else {
+				if meta.Status != model.StatusDeletedInSource {
 					stats.OtherStatuses++
+					continue
+				}
+
+				stats.DeletedOnS3Found++
+
+				// Delete from destination
+				r.logger.Verbose("Deleting %s from destination...", key)
+				if err := r.destination.Delete(ctx, key); err != nil {
+					r.logger.Error("Failed to delete %s: %v", key, err)
+					stats.FailedToDelete++
+					continue
+				}
+
+				r.logger.Debug("Successfully deleted %s from destination", key)
+				stats.SuccessfullyDeleted++
+
+				keysToRemove = append(keysToRemove, key)
+				if len(keysToRemove) >= removeFlushSize {
+					flushRemovals()
 				}
 			}
 		}
 	}
 
-StartDeletion:
-	// Step 2: If no DELETED_ON_S3 files, return early
-	if len(deletedFiles) == 0 {
+	flushRemovals()
+
+	if stats.DeletedOnS3Found == 0 {
 		r.logger.Info("No DELETED_ON_S3 files to delete")
 		return stats, nil
-	}
-
-	r.logger.Info("Found %d DELETED_ON_S3 files to delete from destination", len(deletedFiles))
-
-	// Step 3: Delete files from destination and update cache
-	keysToRemove := make([]string, 0, len(deletedFiles))
-
-	for key := range deletedFiles {
-		select {
-		case <-ctx.Done():
-			return stats, ctx.Err()
-		default:
-			// Delete from destination
-			r.logger.Verbose("Deleting %s from destination...", key)
-			err := r.destination.Delete(ctx, key)
-
-			if err != nil {
-				r.logger.Error("Failed to delete %s: %v", key, err)
-				stats.FailedToDelete++
-			} else {
-				r.logger.Debug("Successfully deleted %s from destination", key)
-				stats.SuccessfullyDeleted++
-				// Mark for removal from cache
-				keysToRemove = append(keysToRemove, key)
-			}
-		}
-	}
-
-	// Step 4: Remove successfully deleted files from cache
-	if len(keysToRemove) > 0 {
-		r.logger.Debug("Removing %d successfully deleted files from cache...", len(keysToRemove))
-		for _, key := range keysToRemove {
-			if err := r.cache.Delete(key); err != nil {
-				r.logger.Warn("Failed to remove %s from cache: %v", key, err)
-			}
-		}
 	}
 
 	r.logger.Info("Deletion completed: %d succeeded, %d failed", stats.SuccessfullyDeleted, stats.FailedToDelete)
